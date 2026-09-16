@@ -5,14 +5,18 @@
 // Supported protocols: VLESS-WS, VLESS-gRPC, VLESS-XHTTP
 // Remark: SHΞN™xray
 
+import { connect } from "cloudflare:sockets";
+
 const WIZARD_URL = "__WIZARD_URL__";
 const USER_ID = "__USER_ID__";
 const PANEL_UUID = "__PANEL_UUID__";
 const PROXY_IP = "__PROXY_IP__"; // optional clean IP
 
+const encoder = new TextEncoder();
+
 // ─── VLESS over WebSocket ───
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const upgradeHeader = request.headers.get("Upgrade");
 
@@ -26,14 +30,12 @@ export default {
       return Response.json({ ok: true, user: USER_ID, time: Date.now() });
     }
 
-    // WebSocket upgrade = VLESS proxy
-    if (upgradeHeader === "websocket") {
-      return await vlessOverWSHandler(request);
-    }
-
     // gRPC over HTTP/2
     if (url.pathname.startsWith("/shen-grpc")) {
-      return await vlessOverGRPCHandler(request);
+      if (upgradeHeader === "websocket") {
+        return await vlessOverGRPCHandler(request);
+      }
+      return new Response("gRPC endpoint", { status: 200 });
     }
 
     // XHTTP (HTTP/2 body streaming)
@@ -41,19 +43,24 @@ export default {
       return await vlessOverXHTTPHandler(request);
     }
 
+    // WebSocket upgrade = VLESS proxy
+    if (upgradeHeader === "websocket") {
+      return await vlessOverWSHandler(request);
+    }
+
     // Default: simple info page
     return new Response("SHΞN™xray node active", {
-      headers: { "content-type": "text/plain" },
+      headers: { "content-type": "text/plain; charset=utf-8" },
     });
   },
 };
 
 // ─── Pool Registration ───
 async function registerWithPool(env) {
-  const workerDomain =
-    typeof self !== "undefined" && self.location
-      ? self.location.hostname
-      : "unknown";
+  let workerDomain = "unknown";
+  try {
+    workerDomain = new URL(WIZARD_URL).hostname;
+  } catch (e) {}
 
   const payload = {
     userId: USER_ID,
@@ -63,7 +70,7 @@ async function registerWithPool(env) {
   };
 
   try {
-    await fetch(`${WIZARD_URL}/api/heartbeat`, {
+    await fetch(WIZARD_URL + "/api/heartbeat", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
@@ -77,57 +84,82 @@ async function registerWithPool(env) {
 
 // ─── VLESS over WebSocket ───
 async function vlessOverWSHandler(request) {
-  const [client, server] = Object.values(new WebSocketPair());
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
+
   server.accept();
-
-  let vlessHeader = null;
-  let remoteSocket = null;
-
   server.binaryType = "arraybuffer";
+
+  let remoteSocket = null;
+  let headerParsed = false;
 
   server.addEventListener("message", async (event) => {
     try {
-      if (!vlessHeader) {
-        // First message = VLESS header
-        vlessHeader = parseVlessHeader(event.data);
+      if (!headerParsed) {
+        const vlessHeader = parseVlessHeader(event.data);
         if (!vlessHeader) {
           server.close(1000, "invalid vless header");
           return;
         }
+        headerParsed = true;
 
-        // Connect to destination
-        const tcps = connect({
+        remoteSocket = connect({
           hostname: vlessHeader.address,
           port: vlessHeader.port,
         });
-        remoteSocket = tcps;
 
-        remoteSocket.opened
-          .then(() => {
-            // Send any remaining data after header
-            if (vlessHeader.dataAfterHeader?.byteLength > 0) {
-              remoteSocket.write(
-                new Uint8Array(vlessHeader.dataAfterHeader)
-              );
-            }
-            pipeRemoteToWS(remoteSocket, server);
+        await remoteSocket.opened;
+
+        // Send VLESS response header: version(0) + addon length(0)
+        server.send(new Uint8Array([0, 0]));
+
+        if (vlessHeader.dataAfterHeader && vlessHeader.dataAfterHeader.byteLength > 0) {
+          const writer = remoteSocket.writable.getWriter();
+          await writer.write(new Uint8Array(vlessHeader.dataAfterHeader));
+          writer.releaseLock();
+        }
+
+        // remote -> WS
+        remoteSocket.readable.pipeTo(
+          new WritableStream({
+            write(chunk) {
+              server.send(chunk);
+            },
+            close() {
+              try { server.close(); } catch (e) {}
+            },
+            abort() {
+              try { server.close(); } catch (e) {}
+            },
           })
-          .catch(() => server.close());
+        ).catch(() => {
+          try { server.close(); } catch (e) {}
+        });
 
-        // Pipe WS → remote
-        pipeWSToRemote(server, remoteSocket);
+        return;
+      }
+
+      if (remoteSocket) {
+        const writer = remoteSocket.writable.getWriter();
+        await writer.write(new Uint8Array(event.data));
+        writer.releaseLock();
       }
     } catch (e) {
-      server.close();
+      try { server.close(); } catch (_) {}
     }
   });
 
   server.addEventListener("close", () => {
-    if (remoteSocket) remoteSocket.close();
+    if (remoteSocket) {
+      try { remoteSocket.close(); } catch (e) {}
+    }
   });
 
   server.addEventListener("error", () => {
-    if (remoteSocket) remoteSocket.close();
+    if (remoteSocket) {
+      try { remoteSocket.close(); } catch (e) {}
+    }
   });
 
   return new Response(null, { status: 101, webSocket: client });
@@ -135,45 +167,57 @@ async function vlessOverWSHandler(request) {
 
 // ─── Parse VLESS Header ───
 function parseVlessHeader(buffer) {
-  const view = new DataView(buffer);
+  const data = buffer instanceof ArrayBuffer ? buffer : new Uint8Array(buffer).buffer;
+  const view = new DataView(data);
+
   if (view.byteLength < 24) return null;
 
   const version = view.getUint8(0);
-  const uuidBytes = new Uint8Array(buffer, 1, 16);
+  const uuidBytes = new Uint8Array(data, 1, 16);
   const uuid = formatUUID(uuidBytes);
-  if (uuid !== PANEL_UUID) return null;
 
-  const addonLength = view.getUint16(17, true); // little-endian
-  let offset = 19 + addonLength;
+  if (uuid.toLowerCase() !== PANEL_UUID.toLowerCase()) return null;
 
-  if (offset + 2 > view.byteLength) return null;
+  const addonLength = view.getUint8(17);
+  let offset = 18 + addonLength;
+
+  if (offset + 4 > view.byteLength) return null;
 
   const cmd = view.getUint8(offset);
   offset += 1;
 
-  if (cmd !== 1 && cmd !== 2) return null; // TCP=1, UDP=2
+  if (cmd !== 1 && cmd !== 2) return null;
 
-  let address, port;
+  const port = view.getUint16(offset, false);
+  offset += 2;
+
+  let address;
   const atype = view.getUint8(offset);
   offset += 1;
 
   if (atype === 1) {
-    // IPv4
-    address = `${view.getUint8(offset)}.${view.getUint8(offset + 1)}.${view.getUint8(offset + 2)}.${view.getUint8(offset + 3)}`;
+    if (offset + 4 > view.byteLength) return null;
+    address =
+      view.getUint8(offset) +
+      "." +
+      view.getUint8(offset + 1) +
+      "." +
+      view.getUint8(offset + 2) +
+      "." +
+      view.getUint8(offset + 3);
     offset += 4;
   } else if (atype === 2) {
-    // Domain
+    if (offset + 1 > view.byteLength) return null;
     const len = view.getUint8(offset);
     offset += 1;
-    address = new TextDecoder().decode(
-      new Uint8Array(buffer, offset, len)
-    );
+    if (offset + len > view.byteLength) return null;
+    address = new TextDecoder().decode(new Uint8Array(data, offset, len));
     offset += len;
   } else if (atype === 3) {
-    // IPv6
+    if (offset + 16 > view.byteLength) return null;
     const parts = [];
     for (let i = 0; i < 8; i++) {
-      parts.push(view.getUint16(offset + i * 2).toString(16));
+      parts.push(view.getUint16(offset + i * 2, false).toString(16));
     }
     address = parts.join(":");
     offset += 16;
@@ -181,79 +225,101 @@ function parseVlessHeader(buffer) {
     return null;
   }
 
-  port = view.getUint16(offset, true); // big-endian for port
-  offset += 2;
+  const dataAfterHeader = data.slice(offset);
 
-  const dataAfterHeader = buffer.slice(offset);
-
-  return { uuid, address, port, dataAfterHeader };
+  return { version, uuid, address, port, dataAfterHeader };
 }
 
 function formatUUID(bytes) {
   const hex = Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  return (
+    hex.slice(0, 8) +
+    "-" +
+    hex.slice(8, 12) +
+    "-" +
+    hex.slice(12, 16) +
+    "-" +
+    hex.slice(16, 20) +
+    "-" +
+    hex.slice(20)
+  );
 }
 
-// ─── Pipe functions ───
-async function pipeWSToRemote(ws, remote) {
-  ws.addEventListener("message", (event) => {
-    try {
-      remote.write(new Uint8Array(event.data));
-    } catch (e) {}
-  });
-}
-
-async function pipeRemoteToWS(remote, ws) {
-  const reader = remote.readable.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      ws.send(value);
-    }
-  } catch (e) {
-  } finally {
-    reader.releaseLock();
-    ws.close();
-  }
-}
-
-// ─── gRPC handler (simplified) ───
+// ─── gRPC handler ───
 async function vlessOverGRPCHandler(request) {
-  // gRPC uses HTTP/2 trailers — forward as WebSocket-like stream
-  const [client, server] = Object.values(new WebSocketPair());
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
+
   server.accept();
   server.binaryType = "arraybuffer";
 
-  // Similar to WS but with gRPC framing
+  let remoteSocket = null;
+  let headerParsed = false;
+
   server.addEventListener("message", async (event) => {
-    // Strip gRPC framing (5 byte header: compressed flag + 4 byte length)
-    const data = new Uint8Array(event.data);
-    if (data.length < 5) return;
-    const payload = data.slice(5); // skip gRPC header
+    try {
+      const raw = new Uint8Array(event.data);
+      if (raw.length < 5) return;
+      const payload = raw.slice(5);
 
-    // Parse VLESS from payload
-    const vlessHeader = parseVlessHeader(payload.buffer);
-    if (!vlessHeader) return;
+      if (!headerParsed) {
+        const vlessHeader = parseVlessHeader(payload.buffer);
+        if (!vlessHeader) return;
+        headerParsed = true;
 
-    const remote = connect({
-      hostname: vlessHeader.address,
-      port: vlessHeader.port,
-    });
+        remoteSocket = connect({
+          hostname: vlessHeader.address,
+          port: vlessHeader.port,
+        });
 
-    remote.opened.then(() => {
-      if (vlessHeader.dataAfterHeader?.byteLength > 0) {
-        remote.write(new Uint8Array(vlessHeader.dataAfterHeader));
+        await remoteSocket.opened;
+
+        if (vlessHeader.dataAfterHeader && vlessHeader.dataAfterHeader.byteLength > 0) {
+          const writer = remoteSocket.writable.getWriter();
+          await writer.write(new Uint8Array(vlessHeader.dataAfterHeader));
+          writer.releaseLock();
+        }
+
+        remoteSocket.readable.pipeTo(
+          new WritableStream({
+            write(chunk) {
+              const framed = new Uint8Array(5 + chunk.byteLength);
+              framed[0] = 0;
+              new DataView(framed.buffer).setUint32(1, chunk.byteLength, false);
+              framed.set(chunk, 5);
+              server.send(framed);
+            },
+            close() {
+              try { server.close(); } catch (e) {}
+            },
+            abort() {
+              try { server.close(); } catch (e) {}
+            },
+          })
+        ).catch(() => {
+          try { server.close(); } catch (e) {}
+        });
+
+        return;
       }
-      pipeRemoteToWS(remote, server);
-    });
 
-    server.addEventListener("message", (e) => {
-      const d = new Uint8Array(e.data);
-      if (d.length > 5) remote.write(d.slice(5));
-    });
+      if (remoteSocket && payload.byteLength > 0) {
+        const writer = remoteSocket.writable.getWriter();
+        await writer.write(payload);
+        writer.releaseLock();
+      }
+    } catch (e) {
+      try { server.close(); } catch (_) {}
+    }
+  });
+
+  server.addEventListener("close", () => {
+    if (remoteSocket) {
+      try { remoteSocket.close(); } catch (e) {}
+    }
   });
 
   return new Response(null, { status: 101, webSocket: client });
@@ -261,39 +327,46 @@ async function vlessOverGRPCHandler(request) {
 
 // ─── XHTTP handler ───
 async function vlessOverXHTTPHandler(request) {
-  // XHTTP = VLESS over HTTP/2/3 body streaming
-  // Client sends VLESS payload as HTTP body, server streams response back
   const body = await request.arrayBuffer();
   const vlessHeader = parseVlessHeader(body);
+
   if (!vlessHeader) {
     return new Response("Bad request", { status: 400 });
   }
 
-  const remote = connect({
+  const remoteSocket = connect({
     hostname: vlessHeader.address,
     port: vlessHeader.port,
   });
 
+  await remoteSocket.opened;
+
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
 
-  remote.opened.then(async () => {
-    if (vlessHeader.dataAfterHeader?.byteLength > 0) {
-      remote.write(new Uint8Array(vlessHeader.dataAfterHeader));
-    }
+  if (vlessHeader.dataAfterHeader && vlessHeader.dataAfterHeader.byteLength > 0) {
+    const remoteWriter = remoteSocket.writable.getWriter();
+    await remoteWriter.write(new Uint8Array(vlessHeader.dataAfterHeader));
+    remoteWriter.releaseLock();
+  }
 
-    const reader = remote.readable.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        writer.write(value);
-      }
-    } catch (e) {
-    } finally {
-      writer.close();
-    }
-  });
+  remoteSocket.readable
+    .pipeTo(
+      new WritableStream({
+        write(chunk) {
+          return writer.write(chunk);
+        },
+        close() {
+          return writer.close();
+        },
+        abort() {
+          return writer.close();
+        },
+      })
+    )
+    .catch(() => {
+      try { writer.close(); } catch (e) {}
+    });
 
   return new Response(readable, {
     headers: {
