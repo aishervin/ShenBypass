@@ -43,3 +43,4 @@ npm run deploy
 - Workers KV (pool state, user data, sessions)
 - No Durable Objects — works on Free plan
 - Pure vanilla JS frontend (no framework)
+# Update
