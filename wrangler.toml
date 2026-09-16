@@ -1,12 +1,21 @@
 name = "shenbypass"
 main = "src/wizard.js"
-compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat"]
+compatibility_date = "2026-09-16"
+compatibility_flags = []
 
-[vars]
-ADMIN_PASSWORD = "shen_admin_2026"
-WIZARD_DOMAIN = "shenbypass.workers.dev"
+# ─── D1 Database ───
+[[d1_databases]]
+binding = "My-database"
+database_id = "49ea6a9e-176b-4979-9e51-a9f2c45babb4"
 
-[[kv_namespaces]]
+# ─── Service Binding: My-kv ───
+[[services]]
+binding = "My-kv"
+service = "shenbypass"
+environment = "production"
+
+# ─── Service Binding: POOL ───
+[[services]]
 binding = "POOL"
-id = "placeholder_kv_id"
+service = "shenbypass"
+environment = "production"
