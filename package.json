@@ -1,0 +1,13 @@
+{
+  "name": "shenbypass",
+  "version": "1.0.0",
+  "description": "SHΞN™Bypass Wizard — Rebranded panel deployment wizard with collaborative node pool",
+  "main": "src/wizard.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
